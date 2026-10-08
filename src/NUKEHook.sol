@@ -62,6 +62,7 @@ contract NUKEHook is IUnlockCallback {
     error BatchTooSoon();
     error ManagerBusy();
     error UnexpectedUnlock();
+    error EmptyBatch();
 
     event FeeAccrued(Currency indexed currency, uint256 amount);
     event Swept(uint256 amount);
@@ -172,10 +173,16 @@ contract NUKEHook is IUnlockCallback {
         return TickMath.getSqrtPriceAtTick(_projectOracle().meanTick);
     }
 
-    /// @notice Maximum adverse 3% movement in IMD per NUKE from the reference.
+    /// @notice Maximum adverse 3% movement from both the reference and the liquid spot price.
     function batchPriceLimit() public view returns (uint160) {
         uint160 ref = referencePrice();
         if (ref == 0) return 0;
+        // An empty-region tick is freely movable and is not an executable market price.
+        // Otherwise spot may only tighten the hourly bound, never relax it.
+        if (poolManager.getLiquidity(poolId) != 0) {
+            (uint160 spot,,,) = poolManager.getSlot0(poolId);
+            if (tokenIs0 ? spot < ref : spot > ref) ref = spot;
+        }
         uint256 limit =
             tokenIs0 ? FullMath.mulDiv(ref, SQRT_103_X96, Q96) : FullMath.mulDivRoundingUp(ref, Q96, SQRT_103_X96);
         if (limit <= TickMath.MIN_SQRT_PRICE) return TickMath.MIN_SQRT_PRICE + 1;
@@ -204,10 +211,20 @@ contract NUKEHook is IUnlockCallback {
         uint160 limit = batchPriceLimit();
         (uint160 spot,,,) = poolManager.getSlot0(poolId);
         if (tokenIs0 ? spot >= limit : spot <= limit) return (0, 0);
-        lastBatch = block.timestamp;
         operation = 2;
-        (spent, burned) = abi.decode(poolManager.unlock(abi.encode(budget, limit)), (uint256, uint256));
+        try poolManager.unlock(abi.encode(budget, limit)) returns (bytes memory result) {
+            (spent, burned) = abi.decode(result, (uint256, uint256));
+        } catch (bytes memory reason) {
+            // Roll back a swap that bought nothing, including any rounded input fee.
+            // Other manager/settlement failures must still propagate to the caller.
+            if (reason.length != 4 || bytes4(reason) != EmptyBatch.selector) {
+                assembly ("memory-safe") { revert(add(reason, 32), mload(reason)) }
+            }
+            operation = 0;
+            return (0, 0);
+        }
         operation = 0;
+        lastBatch = block.timestamp;
         emit BatchExecuted(budget, spent, burned, limit);
     }
 
@@ -228,6 +245,7 @@ contract NUKEHook is IUnlockCallback {
         BalanceDelta delta = poolManager.swap(poolKey(), SwapParams(!tokenIs0, -int256(budget), limit), "");
         uint256 spent = uint256(-int256(tokenIs0 ? delta.amount1() : delta.amount0()));
         uint256 bought = uint256(int256(tokenIs0 ? delta.amount0() : delta.amount1()));
+        if (bought == 0) revert EmptyBatch();
         Currency pair = Currency.wrap(IMD);
         uint256 pairClaims = poolManager.balanceOf(address(this), pair.toId());
         uint256 fromClaims = spent < pairClaims ? spent : pairClaims;
@@ -245,7 +263,9 @@ contract NUKEHook is IUnlockCallback {
 
     function _observe() private {
         Oracle memory next = _projectOracle();
-        (, next.tick,,) = poolManager.getSlot0(poolId);
+        // Preserve the previous observation when a swap ends outside active liquidity.
+        // Moving through empty ticks fills nothing and must not influence future windows.
+        if (poolManager.getLiquidity(poolId) != 0) (, next.tick,,) = poolManager.getSlot0(poolId);
         oracle = next;
     }
 

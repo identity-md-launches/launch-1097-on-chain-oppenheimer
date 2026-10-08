@@ -16,10 +16,10 @@ Default tests run against the actual vendored v4 `PoolManager`, deployed locally
 
 ```sh
 forge test --match-contract MainnetForkTest \
-  --fork-url https://ethereum-rpc.publicnode.com --fork-block-number 26150493
+  --fork-url https://ethereum-rpc.publicnode.com --fork-block-number 26150958
 ```
 
-The fork suite was run successfully at **26,150,493**, against the supplied live PoolManager and IMD addresses, including exact-input/output buys/sells and partial fills, fee redemption, batch buybacks and burns. Test-only balance funding uses Foundry `deal`; the live token/manager code is preserved. Substitute another archive RPC if needed. The default offline suite does not need that RPC.
+This revision passed both fork integration tests at **26,150,958**, against the supplied live PoolManager and IMD addresses, including exact-input/output buys/sells and partial fills, fee redemption, batch buybacks and burns. Test-only balance funding uses Foundry `deal`; the live token/manager code is preserved. The public RPC no longer served historical state for the previous revision's block 26,150,493; the revision was rerun at the newer pinned block above. Substitute another archive RPC if needed. The default offline suite does not need that RPC.
 
 ## Fixed deployment terms
 
@@ -60,18 +60,20 @@ Fees are minted as **ERC-6909 claims owned by the hook** inside the PoolManager.
 
 ## Buybacks and reference price
 
-`executeBatch()` is permissionless and must run while the PoolManager is locked, outside any swap/router unlock. Its first batch requires a full **3600 seconds after initialization**; subsequent batches require 3600 seconds since the last attempted executable batch. `lastBatch()` starts at initialization time to enforce warmup.
+`executeBatch()` is permissionless and must run while the PoolManager is locked, outside any swap/router unlock. Its first batch requires a full **3600 seconds after initialization**; subsequent batches require 3600 seconds since the last batch that bought NUKE. `lastBatch()` starts at initialization time to enforce warmup.
 
 Budget is `floor(pending() / 4)` (at most 25%, capped further at `int128.max` for v4 delta representation). The hook unlocks the manager, swaps exact-input IMD for NUKE, and settles **only the actual input spent**. It burns IMD claims first and uses `sync → transfer → settle` only for any remaining input funded by direct donations. All acquired NUKE goes directly to DEAD. PoolManager omits callbacks for swaps initiated by the hook itself, so batch swaps incur the LP fee and no hook fee. The hook explicitly refreshes its observation after its own swap.
 
-The reference is the **geometric mean price from the time-weighted tick in the most recently completed, launch-aligned one-hour window**. This is an exact hourly window, not a spot observation or a sliding-window approximation. Before that first window completes, `referencePrice()` reports the initial tick's sqrt price, but batches are disabled. The hook records each post-swap tick; elapsed time is credited to the previous tick. Negative mean ticks round down. Window rollover and arbitrarily long idle periods take constant work. The view projects elapsed time even without a new transaction.
+The reference is the **geometric mean price from the time-weighted tick in the most recently completed, launch-aligned one-hour window**. This is an exact hourly window, not a spot observation or a sliding-window approximation. Before that first window completes, `referencePrice()` reports the initial tick's sqrt price, but batches are disabled. The hook adopts a post-swap tick only when the pool has nonzero active liquidity; otherwise it carries the previous eligible tick forward (initially the opening tick). This also applies to observations after its own batches. Empty-region price movement cannot enter the hourly integral. Elapsed time is credited to the previous eligible tick. Negative mean ticks round down. Window rollover and arbitrarily long idle periods take constant work. The view projects elapsed time even without a new transaction.
 
-`referencePrice()` returns **sqrt(token1/token0) in Q64.96**, using sorted pool currencies. Tick quantization is inherited from v4. The batch limit permits a maximum **3% adverse move in IMD per NUKE** from that reference:
+`referencePrice()` returns **sqrt(token1/token0) in Q64.96**, using sorted pool currencies. Tick quantization is inherited from v4. The batch limit permits a maximum **3% adverse move in IMD per NUKE** from both that reference and the current spot when the spot has active liquidity:
 
-- NUKE is currency0: upper sqrt limit = reference × sqrt(1.03), rounded conservatively.
-- NUKE is currency1: lower sqrt limit = reference / sqrt(1.03), rounded conservatively.
+- NUKE is currency0: upper sqrt limit = min(reference, spot) × sqrt(1.03), rounded conservatively.
+- NUKE is currency1: lower sqrt limit = max(reference, spot) / sqrt(1.03), rounded conservatively.
 
-Both limits are clamped inside v4's legal sqrt-price range. `batchPriceLimit()` exposes the computed value. The **price limit is the sole slippage guard**: there is no output minimum or assumption about how much output remains after LP/protocol fees. If the price limit is reached, the trade accepts a partial fill; all unused IMD remains in `pending()`. If the budget rounds to zero or spot is already beyond the limit, the call returns `(0,0)` and does not consume the cooldown. A swap through empty liquidity can also return zero; it completes normally and consumes that batch interval.
+Spot can only tighten the reference bound. When active liquidity is zero, the reference alone sets the limit: an empty-region tick is freely movable and cannot be used as a market price. This lets a batch cross an empty region back into available liquidity.
+
+Both limits are clamped inside v4's legal sqrt-price range. `batchPriceLimit()` exposes the computed value. The **price limit is the sole slippage guard**: there is no quoted minimum output, budget-based output floor, or assumption about how much output remains after LP/protocol fees. If the price limit is reached, the trade accepts a partial fill; all unused IMD remains in `pending()`. If the budget rounds to zero or spot is already beyond the limit, the call returns `(0,0)` and does not consume the cooldown. If a swap buys zero NUKE (including an empty-liquidity swap or rounding-only input charge), its entire manager unlock is rolled back and the call returns `(0,0)` without consuming the cooldown or spending funds. Other manager or settlement failures still revert. Every positive-output partial fill is accepted and consumes the interval, even if small; no fill-percentage threshold permits repeated spending within one hour.
 
 ## Deployment and operation
 
@@ -95,6 +97,8 @@ Those shell variables are values provided by the launch deployment, not environm
 
 IMD is the supplied 18-decimal mainnet token; this is not a generic fee-on-transfer/rebasing-token adapter. The live fork exercises its actual transfers. Standard user swaps remain subject to v4's own validity, liquidity and settlement requirements; the hook adds no price, sender or cooldown restriction to them. Accrual cannot be blocked by an ERC-20 transfer from the hook during callbacks because none occurs.
 
-The hourly reference resists instantaneous manipulation: a same-block price move has no elapsed weight. It can still be influenced by holding a manipulated pool price over time, especially with low liquidity. Its completed-window definition also intentionally lags changing markets. The 3% bound and 25% budget limit exposure; they do not eliminate MEV or provide an external fair-price guarantee. A batch outside the bound can wait for a later reference window without blocking user swaps.
+The hourly reference resists instantaneous manipulation: a same-block price move has no elapsed weight. It can still be influenced by holding a manipulated pool price over time, especially with low liquidity. Its completed-window definition also intentionally lags changing markets. The additional liquid-spot cap prevents a stale high reference from widening the permitted adverse move beyond 3% of the execution-time spot. The 3% bound and 25% budget limit exposure; they do not eliminate MEV or provide an external fair-price guarantee. A batch outside the bound can wait for a later reference window without blocking user swaps.
+
+Revision regression tests cover stale-reference round trips, zero-liquidity observations, direct buybacks across empty regions, and zero-output batch rollback in both currency orderings. Small positive-output fills still consume the hour, so costly interference with batch timing remains possible.
 
 The local security review and its evidence are in `docs/SECURITY_REVIEW.md`. No mainnet deployment or funded-wallet action was performed. An independent adversarial review remains a release responsibility; Slither, Mythril and formal verification were not run.
