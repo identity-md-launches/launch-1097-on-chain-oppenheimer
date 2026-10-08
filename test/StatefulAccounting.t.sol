@@ -118,6 +118,8 @@ contract StatefulAccountingHandler is Test {
         uint256 previousBatch = hook.lastBatch();
         uint256 beforeBurn = hook.pendingBurn();
         uint256 beforeDead = hook.token().balanceOf(hook.DEAD());
+        (uint160 beforePrice, int24 beforeTick,,) = manager.getSlot0(hook.poolId());
+        uint128 beforeLiquidity = manager.getLiquidity(hook.poolId());
         vm.recordLogs();
         try hook.executeBatch() returns (uint256 used, uint256 received) {
             assertGe(block.timestamp - previousBatch, 3600);
@@ -125,7 +127,17 @@ contract StatefulAccountingHandler is Test {
             assertEq(hook.pending(), available - used);
             assertEq(hook.pendingBurn(), beforeBurn, "batch charged itself");
             assertEq(hook.token().balanceOf(hook.DEAD()) - beforeDead, received);
-            if (used > 0) assertEq(hook.lastBatch(), block.timestamp);
+            if (used > 0) {
+                assertGt(received, 0, "batch spent IMD without buying NUKE");
+                assertEq(hook.lastBatch(), block.timestamp);
+            } else {
+                assertEq(received, 0);
+                assertEq(hook.lastBatch(), previousBatch, "empty batch consumed cooldown");
+                (uint160 afterPrice, int24 afterTick,,) = manager.getSlot0(hook.poolId());
+                assertEq(afterPrice, beforePrice, "empty batch changed price");
+                assertEq(afterTick, beforeTick, "empty batch changed tick");
+                assertEq(manager.getLiquidity(hook.poolId()), beforeLiquidity);
+            }
             Vm.Log[] memory logs = vm.getRecordedLogs();
             for (uint256 i; i < logs.length; ++i) {
                 assertFalse(
@@ -134,7 +146,12 @@ contract StatefulAccountingHandler is Test {
             }
             spent += used;
             bought += received;
-            _recordPrice();
+            // A zero budget exits before any observation; a funded no-op may observe
+            // the current liquid spot even when the attempted swap rolls back.
+            if (available >= 4) {
+                if (beforeLiquidity != 0) history.push(Observation(block.timestamp, beforeTick));
+                _recordPrice();
+            }
             ++batches;
         } catch (bytes memory reason) {
             assertEq(reason, abi.encodeWithSelector(NUKEHook.BatchTooSoon.selector));
@@ -185,6 +202,9 @@ contract StatefulAccountingHandler is Test {
     }
 
     function _recordPrice() private {
+        // Empty ticks can move without exchanging value. Retain the last eligible
+        // observation rather than integrating those prices into the reference.
+        if (manager.getLiquidity(hook.poolId()) == 0) return;
         (, int24 tick,,) = manager.getSlot0(hook.poolKey().toId());
         history.push(Observation(block.timestamp, tick));
     }
@@ -247,8 +267,10 @@ contract StatefulAccountingTest is HookFixture {
         handler.toggleLiquidity();
         handler.advanceTime(3600);
         handler.batch();
+        assertEq(handler.spent(), 0);
+        assertEq(hook.lastBatch(), start, "no-liquidity attempt consumed cooldown");
         handler.toggleLiquidity();
-        handler.advanceTime(3600);
+        // Restored liquidity must allow a retry at the very same timestamp.
         handler.batch();
         handler.sweep();
         invariant_accountingAndReferenceSurviveArbitrarySequences();
@@ -256,6 +278,68 @@ contract StatefulAccountingTest is HookFixture {
         assertGt(handler.cooldownRefusals(), 0);
         assertGt(handler.spent(), 0);
         assertGt(handler.bought(), 0);
+    }
+
+    function test_handlerRetainsLiquidObservationAcrossEmptyRegionMovement() public {
+        handler.trade(true, true, 1000 ether, 100);
+        (, int24 liquidTick,,) = manager.getSlot0(key.toId());
+        assertTrue(liquidTick != 0, "setup needs a nonzero liquid observation");
+        handler.advanceTime(900);
+        handler.toggleLiquidity();
+        handler.trade(false, true, 1, 100);
+        (, int24 emptyTick,,) = manager.getSlot0(key.toId());
+        assertTrue(emptyTick != liquidTick, "setup must move through empty liquidity");
+        assertEq(manager.getLiquidity(key.toId()), 0);
+        handler.advanceTime(2700);
+        assertEq(hook.referencePrice(), TickMath.getSqrtPriceAtTick(liquidTick));
+        invariant_accountingAndReferenceSurviveArbitrarySequences();
+
+        handler.advanceTime(7200);
+        assertEq(hook.referencePrice(), TickMath.getSqrtPriceAtTick(liquidTick));
+        invariant_accountingAndReferenceSurviveArbitrarySequences();
+    }
+
+    function test_handlerZeroBudgetDoesNotObserveRestoredLiquidity() public {
+        handler.toggleLiquidity();
+        handler.trade(true, true, 1, 100);
+        handler.toggleLiquidity();
+        assertEq(manager.getLiquidity(key.toId()), LIQUIDITY);
+        (, int24 restoredTick,,) = manager.getSlot0(key.toId());
+        assertTrue(restoredTick != 0, "setup needs a changed, unobserved spot");
+        handler.advanceTime(3600);
+        handler.batch();
+        handler.advanceTime(3600);
+        assertEq(hook.referencePrice(), Q96, "zero-budget attempt sampled a new tick");
+        invariant_accountingAndReferenceSurviveArbitrarySequences();
+
+        // A funded batch can adopt the restored liquid price and buy tokens.
+        handler.donate(true, true, 1000 ether);
+        handler.batch();
+        assertGt(handler.spent(), 0);
+        assertGt(handler.bought(), 0);
+        (, int24 boughtTick,,) = manager.getSlot0(key.toId());
+        handler.advanceTime(3600);
+        assertEq(hook.referencePrice(), TickMath.getSqrtPriceAtTick(boughtTick));
+        invariant_accountingAndReferenceSurviveArbitrarySequences();
+    }
+
+    function test_handlerFundedZeroOutputBatchRetainsLiquidObservation() public {
+        handler.toggleLiquidity();
+        handler.trade(true, true, 1, 100);
+        handler.toggleLiquidity();
+        (, int24 restoredTick,,) = manager.getSlot0(key.toId());
+        assertTrue(restoredTick != 0);
+        handler.advanceTime(3600);
+        handler.donate(true, true, 4); // One wei of budget cannot buy any NUKE after the LP fee.
+        handler.batch();
+        assertEq(handler.spent(), 0);
+        assertEq(handler.bought(), 0);
+        assertEq(hook.pending(), 4);
+        assertEq(hook.lastBatch(), start);
+        handler.advanceTime(3600);
+        // The swap rolls back, but its initial liquid price observation remains valid.
+        assertEq(hook.referencePrice(), TickMath.getSqrtPriceAtTick(restoredTick));
+        invariant_accountingAndReferenceSurviveArbitrarySequences();
     }
 
     function test_handlerCanReverseAtAnEmptyTickBitmapBoundary() public {
