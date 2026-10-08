@@ -1,0 +1,21 @@
+{
+  "kind": "univ4_hook",
+  "token": {
+    "contract": "NUKE",
+    "name": "On-Chain Oppenheimer",
+    "symbol": "NUKE",
+    "decimals": 18
+  },
+  "hook": {
+    "contract": "NUKEHook",
+    "constructorArgs": ["$poolManager", "$token"],
+    "permissions": ["beforeInitialize", "beforeSwap", "afterSwap", "afterSwapReturnDelta"]
+  },
+  "pool": {
+    "pairedCurrency": "0xd34a99bc0f67ae1bbd63c660e6d0b0dd03e263b7",
+    "fee": 12500,
+    "tickSpacing": 60,
+    "initialPrice": "79228162514264337593543950336"
+  },
+  "notes": "Ethereum mainnet (chainId 1). NUKE has no constructor args and mints 1e27 units to its deployer; the launch factory handles the 90% pool / 10% swarm allocation and remainderTo. NUKEHook constructor args are IPoolManager $poolManager (mainnet 0x000000000004444c5dc75cB358380D2e3dE08A90) and address $token. Deploy the hook itself via CREATE2 with address & 0x3fff == 0x20c4 (8388). Static 12500 LP fee plus 100 bps hook fee on the actual unspecified BalanceDelta in afterSwap; no beforeSwap delta or LP override. Fees accrue as ERC-6909 claims. Anyone may sweep NUKE to DEAD or execute an hourly batch spending at most 25% of pending IMD within a 3% adverse price limit based on the last completed hour's time-weighted tick. Partial fills retain unspent IMD. Batch swaps pay only the pool LP fee and send all bought NUKE to DEAD. The initialPrice is provenance only; the factory sets the economic opening price. No owner, setters, proxy, or upgradeability."
+}
