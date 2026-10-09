@@ -27,7 +27,11 @@ contract SettlementEdgesTest is HookFixture {
         _swap(false, true, 1000 ether, false);
         uint256 pending = hook.pending();
         uint256 burn = hook.pendingBurn();
-        (uint160 price,,,) = manager.getSlot0(key.toId());
+        (uint160 price, int24 tick,,) = manager.getSlot0(key.toId());
+        int24 observed = hook.observedTick();
+        // The observation is the executable ask: on the expensive side of the raw spot tick.
+        if (hook.tokenIs0()) assertGe(observed, tick);
+        else assertLe(observed, tick);
         vm.warp(start + 1800);
         IERC20(IMD).approve(address(actor), 0);
         bool tokenIs0 = hook.tokenIs0();
@@ -42,8 +46,9 @@ contract SettlementEdgesTest is HookFixture {
         assertEq(afterPrice, price);
         assertEq(hook.pending(), pending);
         assertEq(hook.pendingBurn(), burn);
+        assertEq(hook.observedTick(), observed, "a reverted swap left an observation behind");
         vm.warp(start + 3600);
-        assertEq(hook.referencePrice(), TickMath.getSqrtPriceAtTick(TickMath.getTickAtSqrtPrice(price)));
+        assertEq(hook.referencePrice(), TickMath.getSqrtPriceAtTick(observed));
         IERC20(IMD).approve(address(actor), type(uint256).max);
         _swap(true, true, 1000 ether, false);
         _settled();
