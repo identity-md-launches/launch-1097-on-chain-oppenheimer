@@ -65,7 +65,7 @@ contract OracleLiquidityTest is HookFixture {
         _nukeOnlyPosition(60);
         vm.warp(start + 100);
         _swap(true, true, 100 ether, false);
-        (, int24 activeTick,,) = manager.getSlot0(key.toId());
+        int24 activeTick = _observedTick();
         assertEq(manager.getLiquidity(key.toId()), LIQUIDITY);
         assertTrue(activeTick != 0, "setup needs a nonzero liquid tick");
         IERC20(IMD).transfer(address(hook), 100_000 ether);
@@ -80,6 +80,8 @@ contract OracleLiquidityTest is HookFixture {
         assertEq(manager.getLiquidity(key.toId()), 0, "batch did not leave liquidity");
         (, int24 emptyTick,,) = manager.getSlot0(key.toId());
         assertTrue(emptyTick != activeTick, "batch did not move slot0");
+        (, bool found) = hook.askPrice();
+        assertFalse(found, "exhausted position still reported an ask");
         vm.warp(start + 7200);
         assertEq(hook.referencePrice(), TickMath.getSqrtPriceAtTick(activeTick), "batch recorded empty-region tick");
         _settled();
@@ -90,7 +92,8 @@ contract OracleLiquidityTest is HookFixture {
         vm.warp(start + 112);
         _swap(true, true, 100 ether, false);
         assertEq(manager.getLiquidity(key.toId()), LIQUIDITY, "buy did not restore active liquidity");
-        (, activeTick,,) = manager.getSlot0(key.toId());
+        activeTick = hook.observedTick();
+        assertApproxEqAbs(int256(activeTick), int256(_observedTick()), 1);
     }
 
     function _nukeOnlyPosition(int24 width) internal {
@@ -113,6 +116,8 @@ contract OracleLiquidityTest is HookFixture {
         (uint160 emptyPrice,,,) = manager.getSlot0(key.toId());
         assertEq(emptyPrice, limit, "empty-region sell did not reach extreme price");
         assertEq(hook.pending() + hook.pendingBurn(), 0, "empty sell accrued a fee");
+        (, bool found) = hook.askPrice();
+        assertFalse(found, "deep empty region reported an ask");
         _settled();
     }
 }

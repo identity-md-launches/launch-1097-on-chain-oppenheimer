@@ -57,18 +57,60 @@ contract DustBatchTest is HookFixture {
         _settled();
     }
 
-    function test_tinyPositiveOutputPartialFillConsumesInterval() public {
-        _parkInsideLimit(1_000_000);
+    /// @dev A griefer parks spot a few sqrt-price units inside the limit so the batch buys a few wei.
+    /// The dust is kept, but a fill below 1% of the budget must not consume the hourly interval.
+    function test_tinyPositiveOutputPartialFillLeavesIntervalAvailable() public {
+        BalanceDelta front = _parkInsideLimit(131_072);
         uint256 pendingBefore = hook.pending();
         (uint256 spent, uint256 burned) = hook.executeBatch();
         assertGt(spent, 0);
         assertGt(burned, 0);
         assertLt(spent, 100, "test should exercise a tiny real fill");
+        assertLt(spent * 100, pendingBefore / 4, "fill should be below the 1% floor");
         assertEq(hook.pending(), pendingBefore - spent);
         assertEq(nuke.balanceOf(DEAD), burned);
+        assertEq(hook.lastBatch(), start, "dust fill consumed the interval");
+        _settled();
+
+        // Once the griefer unwinds, the real batch runs in this same hour and commits the interval.
+        uint256 received = uint256(int256(hook.tokenIs0() ? front.amount0() : front.amount1()));
+        actor.swap(
+            key,
+            SwapParams(
+                hook.tokenIs0(),
+                -int256(received),
+                hook.tokenIs0() ? TickMath.MIN_SQRT_PRICE + 1 : TickMath.MAX_SQRT_PRICE - 1
+            )
+        );
+        (spent, burned) = hook.executeBatch();
+        assertGe(spent * 100, hook.pending() / 3, "real batch should fill far above the floor");
+        assertGt(burned, 0);
         assertEq(hook.lastBatch(), block.timestamp);
         vm.expectRevert(NUKEHook.BatchTooSoon.selector);
         hook.executeBatch();
+        _settled();
+    }
+
+    /// @dev Around the floor: a partial fill just above 1% of the budget is a batch; just below is not.
+    function test_partialFillJustAboveOnePercentCommitsInterval() public {
+        _parkInsideLimit(8e25);
+        uint256 budget = hook.pending() / 4;
+        (uint256 spent, uint256 burned) = hook.executeBatch();
+        assertGt(burned, 0);
+        assertGe(spent * 100, budget, "fill should be just above the floor");
+        assertLt(spent * 50, budget, "fill should still be a small partial fill");
+        assertEq(hook.lastBatch(), block.timestamp);
+        _settled();
+    }
+
+    function test_partialFillJustBelowOnePercentLeavesIntervalAvailable() public {
+        _parkInsideLimit(7e25);
+        uint256 budget = hook.pending() / 4;
+        (uint256 spent, uint256 burned) = hook.executeBatch();
+        assertGt(burned, 0);
+        assertLt(spent * 100, budget, "fill should be just below the floor");
+        assertGt(spent * 200, budget, "fill should be close to the floor");
+        assertEq(hook.lastBatch(), start);
         _settled();
     }
 

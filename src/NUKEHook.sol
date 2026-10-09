@@ -9,6 +9,10 @@ import {StateLibrary} from "v4-core/src/libraries/StateLibrary.sol";
 import {TransientStateLibrary} from "v4-core/src/libraries/TransientStateLibrary.sol";
 import {TickMath} from "v4-core/src/libraries/TickMath.sol";
 import {FullMath} from "v4-core/src/libraries/FullMath.sol";
+import {SqrtPriceMath} from "v4-core/src/libraries/SqrtPriceMath.sol";
+import {TickBitmap} from "v4-core/src/libraries/TickBitmap.sol";
+import {BitMath} from "v4-core/src/libraries/BitMath.sol";
+import {LiquidityMath} from "v4-core/src/libraries/LiquidityMath.sol";
 import {Currency} from "v4-core/src/types/Currency.sol";
 import {PoolKey} from "v4-core/src/types/PoolKey.sol";
 import {PoolId} from "v4-core/src/types/PoolId.sol";
@@ -31,6 +35,13 @@ contract NUKEHook is IUnlockCallback {
     uint24 public constant LP_FEE = 12500;
     int24 public constant TICK_SPACING = 60;
     uint160 public constant FLAGS = 0x20c4;
+    /// @notice An observation must find this share of the manager's NUKE (outside hook claims) for sale: 0.25%.
+    uint256 public constant DEPTH_DIVISOR = 400;
+    /// @notice An observation may sit at most this far on the cheap side of the last completed hour's mean.
+    int24 public constant BAND_TICKS = 2000;
+    /// @notice A batch filling less than this share of its budget leaves the interval open: 1%.
+    uint256 public constant MIN_FILL_DIVISOR = 100;
+    uint256 private constant MAX_WALK_STEPS = 16;
     uint256 private constant Q96 = 1 << 96;
     // floor(sqrt(1.03) * 2**96); rounding makes both directional limits conservative.
     uint256 private constant SQRT_103_X96 = 80407803025877290703249465302;
@@ -166,23 +177,75 @@ contract NUKEHook is IUnlockCallback {
         return poolManager.balanceOf(address(this), token.toId()) + token.balanceOfSelf();
     }
 
-    /// @notice Sqrt price X96 from the geometric mean tick in the last completed hour.
-    /// @dev During warmup this reports the initial tick price; batches cannot run yet.
+    /// @notice Sqrt price X96 from the time-weighted mean observed tick in the last completed hour.
+    /// @dev Observations are the price at which observationDepth() NUKE was purchasable, each at most
+    /// BAND_TICKS on the cheap side of the previous mean. During warmup this reports the initial
+    /// tick price; batches cannot run yet.
     function referencePrice() public view returns (uint160) {
         if (!initialized) return 0;
         return TickMath.getSqrtPriceAtTick(_projectOracle().meanTick);
     }
 
-    /// @notice Maximum adverse 3% movement from both the reference and the liquid spot price.
+    /// @notice The tick currently accruing time in the hourly integral: the last observation after its band clamp.
+    function observedTick() external view returns (int24) {
+        return oracle.tick;
+    }
+
+    /// @notice NUKE an observation must find purchasable: 0.25% of the manager's NUKE outside the hook's claims.
+    /// @dev Inside afterSwap the swapper has not settled yet, so the balance is the pre-swap one.
+    function observationDepth() public view returns (uint256) {
+        uint256 held = token.balanceOf(address(poolManager));
+        uint256 claims = poolManager.balanceOf(address(this), token.toId());
+        return (held > claims ? held - claims : 0) / DEPTH_DIVISOR;
+    }
+
+    /// @notice Sqrt price after buying observationDepth() NUKE from the pool's current state.
+    /// @dev Walks initialized ticks in the buying direction, as the swap loop would, for at most
+    /// MAX_WALK_STEPS. A spot that cannot sell that depth nearby (an empty region, or a dust position
+    /// with nothing behind it) is not an executable price and reports found = false.
+    function askPrice() public view returns (uint160 sqrtPriceX96, bool found) {
+        uint256 need = observationDepth();
+        if (need == 0) return (0, false);
+        (uint160 sqrtP, int24 tick,,) = poolManager.getSlot0(poolId);
+        uint128 liquidity = poolManager.getLiquidity(poolId);
+        for (uint256 step; step < MAX_WALK_STEPS; ++step) {
+            (int24 next, bool crossing) = _nextTick(tick);
+            if (next < TickMath.MIN_TICK) next = TickMath.MIN_TICK;
+            if (next > TickMath.MAX_TICK) next = TickMath.MAX_TICK;
+            uint160 sqrtNext = TickMath.getSqrtPriceAtTick(next);
+            if (liquidity != 0) {
+                uint256 avail = tokenIs0
+                    ? SqrtPriceMath.getAmount0Delta(sqrtP, sqrtNext, liquidity, false)
+                    : SqrtPriceMath.getAmount1Delta(sqrtNext, sqrtP, liquidity, false);
+                if (avail >= need) {
+                    sqrtPriceX96 = tokenIs0
+                        ? SqrtPriceMath.getNextSqrtPriceFromAmount0RoundingUp(sqrtP, liquidity, need, false)
+                        : SqrtPriceMath.getNextSqrtPriceFromAmount1RoundingDown(sqrtP, liquidity, need, false);
+                    if (sqrtPriceX96 >= TickMath.MAX_SQRT_PRICE) sqrtPriceX96 = TickMath.MAX_SQRT_PRICE - 1;
+                    return (sqrtPriceX96, true);
+                }
+                need -= avail;
+            }
+            if (tokenIs0 ? next >= TickMath.MAX_TICK : next <= TickMath.MIN_TICK) break;
+            sqrtP = sqrtNext;
+            if (crossing) {
+                (, int128 net) = poolManager.getTickLiquidity(poolId, next);
+                liquidity = LiquidityMath.addDelta(liquidity, tokenIs0 ? net : -net);
+            }
+            tick = tokenIs0 ? next : next - 1;
+        }
+        return (0, false);
+    }
+
+    /// @notice Maximum adverse 3% movement from both the reference and the executable spot price.
     function batchPriceLimit() public view returns (uint160) {
         uint160 ref = referencePrice();
         if (ref == 0) return 0;
-        // An empty-region tick is freely movable and is not an executable market price.
-        // Otherwise spot may only tighten the hourly bound, never relax it.
-        if (poolManager.getLiquidity(poolId) != 0) {
-            (uint160 spot,,,) = poolManager.getSlot0(poolId);
-            if (tokenIs0 ? spot < ref : spot > ref) ref = spot;
-        }
+        // Only a spot that can actually sell the observation depth is an executable market price,
+        // and it may only tighten the hourly bound, never relax it. An empty region or a dust
+        // position does not count, so a batch can still cross it into real liquidity.
+        (uint160 ask, bool found) = askPrice();
+        if (found && (tokenIs0 ? ask < ref : ask > ref)) ref = ask;
         uint256 limit =
             tokenIs0 ? FullMath.mulDiv(ref, SQRT_103_X96, Q96) : FullMath.mulDivRoundingUp(ref, Q96, SQRT_103_X96);
         if (limit <= TickMath.MIN_SQRT_PRICE) return TickMath.MIN_SQRT_PRICE + 1;
@@ -224,7 +287,9 @@ contract NUKEHook is IUnlockCallback {
             return (0, 0);
         }
         operation = 0;
-        lastBatch = block.timestamp;
+        // A fill below 1% of the budget is dust parked inside the limit, not a batch: it keeps what it
+        // bought but leaves the hourly slot available, so no cheap fill can consume the interval.
+        if (spent * MIN_FILL_DIVISOR >= budget) lastBatch = block.timestamp;
         emit BatchExecuted(budget, spent, burned, limit);
     }
 
@@ -263,10 +328,40 @@ contract NUKEHook is IUnlockCallback {
 
     function _observe() private {
         Oracle memory next = _projectOracle();
-        // Preserve the previous observation when a swap ends outside active liquidity.
-        // Moving through empty ticks fills nothing and must not influence future windows.
-        if (poolManager.getLiquidity(poolId) != 0) (, next.tick,,) = poolManager.getSlot0(poolId);
+        // Observe the price at which the observation depth is actually purchasable. Preserve the
+        // previous observation when nothing of that size is for sale nearby: moving the spot through
+        // empty ticks or into a dust position fills nothing and must not influence future windows.
+        (uint160 ask, bool found) = askPrice();
+        int24 tick = found ? TickMath.getTickAtSqrtPrice(ask) : next.tick;
+        // One observation may move at most BAND_TICKS below the completed hour's mean, so a single
+        // block at a cheap tick cannot shift the next reference by the whole 3% limit.
+        int24 cheapest = tokenIs0 ? next.meanTick - BAND_TICKS : next.meanTick + BAND_TICKS;
+        if (tokenIs0 ? tick < cheapest : tick > cheapest) tick = cheapest;
+        next.tick = tick;
         oracle = next;
+    }
+
+    /// @dev TickBitmap.nextInitializedTickWithinOneWord over extsload, searching in the NUKE-buying direction.
+    function _nextTick(int24 tick) private view returns (int24 next, bool crossing) {
+        unchecked {
+            int24 compressed = TickBitmap.compress(tick, TICK_SPACING);
+            if (tokenIs0) {
+                (int16 wordPos, uint8 bitPos) = TickBitmap.position(++compressed);
+                uint256 masked = poolManager.getTickBitmap(poolId, wordPos) & ~((uint256(1) << bitPos) - 1);
+                crossing = masked != 0;
+                next = crossing
+                    ? (compressed + int24(uint24(BitMath.leastSignificantBit(masked) - bitPos))) * TICK_SPACING
+                    : (compressed + int24(uint24(type(uint8).max - bitPos))) * TICK_SPACING;
+            } else {
+                (int16 wordPos, uint8 bitPos) = TickBitmap.position(compressed);
+                uint256 masked = poolManager.getTickBitmap(poolId, wordPos)
+                    & (type(uint256).max >> (uint256(type(uint8).max) - bitPos));
+                crossing = masked != 0;
+                next = crossing
+                    ? (compressed - int24(uint24(bitPos - BitMath.mostSignificantBit(masked)))) * TICK_SPACING
+                    : (compressed - int24(uint24(bitPos))) * TICK_SPACING;
+            }
+        }
     }
 
     /// @dev Splits elapsed time at hourly boundaries in O(1), even after years of inactivity.

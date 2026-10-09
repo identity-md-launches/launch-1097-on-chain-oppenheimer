@@ -13,6 +13,7 @@ import {BeforeSwapDelta} from "v4-core/src/types/BeforeSwapDelta.sol";
 import {SwapParams, ModifyLiquidityParams} from "v4-core/src/types/PoolOperation.sol";
 import {StateLibrary} from "v4-core/src/libraries/StateLibrary.sol";
 import {TickMath} from "v4-core/src/libraries/TickMath.sol";
+import {SqrtPriceMath} from "v4-core/src/libraries/SqrtPriceMath.sol";
 import {IERC20} from "@openzeppelin/contracts/token/ERC20/IERC20.sol";
 import {Vm} from "forge-std/Vm.sol";
 import {MineHook} from "../script/MineHook.s.sol";
@@ -264,7 +265,9 @@ contract NUKEHookTest is HookFixture {
     function test_hourlyReferenceWeightsElapsedTimeAndFloorsNegativeTicks() public {
         vm.warp(start + 901);
         _swap(true, true, 10_000 ether, false);
-        (, int24 tick,,) = manager.getSlot0(key.toId());
+        int24 tick = hook.observedTick();
+        // The callback observed the pre-settlement depth; the resting view agrees within a tick.
+        assertApproxEqAbs(int256(tick), int256(_observedTick()), 1);
         assertEq(hook.referencePrice(), Q96);
         vm.warp(start + 3600);
         int256 integral = int256(tick) * 2699;
@@ -283,6 +286,34 @@ contract NUKEHookTest is HookFixture {
         uint256 ref = hook.referencePrice();
         uint256 ratio = hook.tokenIs0() ? limit * 1e18 / ref : ref * 1e18 / limit;
         assertApproxEqAbs(ratio * ratio / 1e18, 1.03e18, 3);
+    }
+
+    function test_askPriceIsWhereObservationDepthIsPurchasable() public {
+        (uint160 spot,,,) = manager.getSlot0(key.toId());
+        uint256 depth = hook.observationDepth();
+        assertEq(depth, (nuke.balanceOf(address(manager)) - hook.pendingBurn()) / 400);
+        assertGt(depth, 0);
+        (uint160 ask, bool found) = hook.askPrice();
+        assertTrue(found);
+        uint160 expected = hook.tokenIs0()
+            ? SqrtPriceMath.getNextSqrtPriceFromAmount0RoundingUp(spot, LIQUIDITY, depth, false)
+            : SqrtPriceMath.getNextSqrtPriceFromAmount1RoundingDown(spot, LIQUIDITY, depth, false);
+        assertEq(ask, expected);
+        // Buying exactly that depth lands the pool on the observed price.
+        actor.swap(
+            key,
+            SwapParams(
+                !hook.tokenIs0(),
+                int256(depth),
+                hook.tokenIs0() ? TickMath.MAX_SQRT_PRICE - 1 : TickMath.MIN_SQRT_PRICE + 1
+            )
+        );
+        (uint160 landed,,,) = manager.getSlot0(key.toId());
+        assertApproxEqAbs(landed, ask, 1);
+        // Without liquidity nothing is purchasable, so there is no observable price.
+        actor.liquidity(key, ModifyLiquidityParams(-12000, 12000, -int256(uint256(LIQUIDITY)), bytes32(0)));
+        (, found) = hook.askPrice();
+        assertFalse(found);
     }
 
     function test_offlineMinerMatchesActualCreate2Deployment() public {
@@ -312,10 +343,12 @@ contract NUKEHookTest is HookFixture {
         uint256 second = bound(uint256(secondSeed), first + 1, 3599);
         vm.warp(start + first);
         _swap(buy, true, 10_000 ether, false);
-        (, int24 firstTick,,) = manager.getSlot0(key.toId());
+        int24 firstTick = hook.observedTick();
+        assertApproxEqAbs(int256(firstTick), int256(_observedTick()), 1);
         vm.warp(start + second);
         _swap(!buy, true, 1000 ether, false);
-        (, int24 secondTick,,) = manager.getSlot0(key.toId());
+        int24 secondTick = hook.observedTick();
+        assertApproxEqAbs(int256(secondTick), int256(_observedTick()), 1);
         int256 integral = int256(firstTick) * int256(second - first) + int256(secondTick) * int256(3600 - second);
         int256 mean = integral / 3600;
         if (integral < 0 && integral % 3600 != 0) --mean;

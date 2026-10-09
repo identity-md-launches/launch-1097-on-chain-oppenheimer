@@ -125,6 +125,13 @@ abstract contract HookFixture is Test {
         _settled();
     }
 
+    /// @dev The tick the hook records for the current pool state: where observationDepth() NUKE is purchasable.
+    function _observedTick() internal view returns (int24) {
+        (uint160 ask, bool found) = hook.askPrice();
+        require(found, "no observable ask at this spot");
+        return TickMath.getTickAtSqrtPrice(ask);
+    }
+
     function _settled() internal view {
         assertEq(manager.getNonzeroDeltaCount(), 0);
         assertEq(manager.currencyDelta(address(hook), key.currency0), 0);

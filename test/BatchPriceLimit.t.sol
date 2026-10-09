@@ -56,14 +56,23 @@ contract BatchPriceLimitTest is HookFixture {
         IERC20(IMD).transfer(address(hook), 400_000 ether);
         vm.warp(start + bound(uint256(timeSeed), 3600, 7199));
         uint160 originalLimit = hook.batchPriceLimit();
-        _trade(false, bound(uint256(sellSeed), 1 ether, 100_000 ether));
+        // Sell enough that the executable ask (spot plus the observation depth) falls below the reference.
+        _trade(false, bound(uint256(sellSeed), 5000 ether, 100_000 ether));
         assertEq(hook.referencePrice(), Q96, "same-block sell changed completed reference");
         (uint160 spot,,,) = manager.getSlot0(key.toId());
+        (uint160 ask, bool found) = hook.askPrice();
+        assertTrue(found);
         uint160 limit = hook.batchPriceLimit();
         if (hook.tokenIs0()) assertLt(limit, originalLimit);
         else assertGt(limit, originalLimit);
+        // The executable spot is where observationDepth() NUKE is purchasable: 0.25% of this test
+        // pool's NUKE, which its two-sided 1e24 liquidity sells within about 0.25% of slot0.
+        uint256 askSqrtRatio = hook.tokenIs0() ? FullMath.mulDiv(ask, 1e18, spot) : FullMath.mulDiv(spot, 1e18, ask);
+        uint256 askPriceRatio = FullMath.mulDiv(askSqrtRatio, askSqrtRatio, 1e18);
+        assertGe(askPriceRatio, 1e18);
+        assertLe(askPriceRatio, 1.01e18);
         uint256 adverseSqrtRatio =
-            hook.tokenIs0() ? FullMath.mulDiv(limit, 1e18, spot) : FullMath.mulDiv(spot, 1e18, limit);
+            hook.tokenIs0() ? FullMath.mulDiv(limit, 1e18, ask) : FullMath.mulDiv(ask, 1e18, limit);
         uint256 adversePriceRatio = FullMath.mulDiv(adverseSqrtRatio, adverseSqrtRatio, 1e18);
         assertLe(adversePriceRatio, 1.03e18);
         assertApproxEqAbs(adversePriceRatio, 1.03e18, 3);
